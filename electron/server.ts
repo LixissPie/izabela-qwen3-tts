@@ -2,52 +2,35 @@ import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import { store } from './store.ts'
-import { FORM_STORAGE_KEY } from '../src/forms/xtts/consts.ts'
+import { FORM_STORAGE_KEY } from '../src/forms/piper/consts.ts'
 
 const PORT = 6789;
-const DEFAULT_TTS_API_URL = "http://192.168.100.12:42003";
+const DEFAULT_PIPER_API_URL = 'http://127.0.0.1:5000';
 const LOCAL_FORM_FIELDS = new Set(['apiUrl']);
 const IS_DEV = Boolean(process.env.VITE_DEV_SERVER_URL) || process.env.NODE_ENV === 'development';
 const expressApp = express();
 
-type ApiParameter = {
-    parameter_name?: string;
-};
-type ApiEndpoint = {
-    parameters?: ApiParameter[];
-};
-type ApiInfo = {
-    named_endpoints?: Record<string, ApiEndpoint>;
-};
-type GradioDependency = {
-    id?: number;
-    api_name?: string | false;
-};
-type GradioConfig = {
-    dependencies?: GradioDependency[];
-};
-type GeneratedAudio = {
-    path?: string;
-    url?: string | null;
-    orig_name?: string | null;
-    mime_type?: string | null;
-};
-type GenerateVoiceDesignResponseData = [GeneratedAudio, string?];
-type TtsPayload = {
-    text: unknown;
-    language: unknown;
-    voice_description: string;
-    seed: unknown;
+type IzabelaVoice = {
+    id: string;
+    name: string;
+    category: string;
+    languageCode: string;
 };
 
-const VOICE_DESIGN_ID = 'voice-design';
-const DEFAULT_VOICE_DESCRIPTION =
-    'Speak clearly with a warm, natural tone and calm pacing.';
-const VOICE_DESIGN_VOICE = {
-    id: VOICE_DESIGN_ID,
-    name: 'Voice Design',
-    category: 'Qwen3-TTS',
-    languageCode: 'en-US',
+type PiperVoiceInfo = {
+    name?: string;
+    language?: string | { code?: string };
+    sample_rate?: number;
+};
+
+type PiperVoicesResponse = Record<string, PiperVoiceInfo>;
+
+type PiperSynthesisPayload = {
+    text: string;
+    voice?: string;
+    length_scale?: number;
+    noise_scale?: number;
+    noise_w_scale?: number;
 };
 
 function devLog(event: string, data?: Record<string, unknown>) {
@@ -146,102 +129,140 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init: RequestIni
     }
 }
 
-function getGradioApiUrl(apiUrl: string, path: string) {
-    return `${apiUrl}/gradio_api/${path.replace(/^\/+/, '')}`;
+function getConfiguredPiperApiUrl() {
+    const formData = store.get(FORM_STORAGE_KEY, {}) as Record<string, unknown>;
+    const configuredUrl = process.env.PIPER_API_URL || formData.apiUrl || DEFAULT_PIPER_API_URL;
+
+    const apiUrl = String(configuredUrl)
+        .trim()
+        .replace(/[?#].*$/, '')
+        .replace(/\/+$/, '');
+
+    devLog('config:piper-api-url', { apiUrl });
+
+    return apiUrl;
 }
 
-async function getTtsApiInfo(apiUrl: string) {
-    const response = await fetchWithRetry(getGradioApiUrl(apiUrl, 'info'), {}, {
-        event: 'tts-api:info',
-        attempts: 3,
-        timeoutMs: 15000,
-    });
-
-    if (!response.ok) {
-        throw new Error(`TTS API info request failed: ${response.status} ${response.statusText}`);
+function getFormValue<T>(formData: Record<string, unknown>, key: string, fallback: T) {
+    if (LOCAL_FORM_FIELDS.has(key)) {
+        return fallback;
     }
 
-    return await response.json() as ApiInfo;
+    return Object.hasOwn(formData, key) ? formData[key] as T : fallback;
 }
 
-async function getTtsConfig(apiUrl: string) {
-    const response = await fetchWithRetry(`${apiUrl}/config`, {}, {
-        event: 'tts-api:config',
-        attempts: 3,
-        timeoutMs: 15000,
-    });
-
-    if (!response.ok) {
-        throw new Error(`TTS API config request failed: ${response.status} ${response.statusText}`);
+function parseLanguageCode(voiceKey: string, info: PiperVoiceInfo): string {
+    if (typeof info.language === 'string' && info.language.includes('-')) {
+        return info.language;
     }
 
-    return await response.json() as GradioConfig;
-}
-
-function getVoiceDesignFnIndex(config: GradioConfig) {
-    const dependency = config.dependencies?.find((item) => item.api_name === 'generate_voice_design');
-
-    if (typeof dependency?.id !== 'number') {
-        throw new Error('TTS API config does not expose generate_voice_design dependency id');
+    if (typeof info.language === 'object' && info.language?.code) {
+        return info.language.code;
     }
 
-    return dependency.id;
+    const name = info.name || voiceKey.replace(/\.onnx$/i, '');
+    const match = name.match(/^([a-z]{2})_([A-Z]{2})/i);
+
+    if (match) {
+        return `${match[1].toLowerCase()}-${match[2].toUpperCase()}`;
+    }
+
+    return 'en-US';
 }
 
-async function runVoiceDesign(apiUrl: string, payload: TtsPayload) {
-    const config = await getTtsConfig(apiUrl);
-    const fnIndex = getVoiceDesignFnIndex(config);
-    const requestBody = {
-        data: [
-            payload.text,
-            payload.language,
-            payload.voice_description,
-            payload.seed,
-        ],
-        event_data: null,
-        fn_index: fnIndex,
-        trigger_id: null,
-        session_hash: Math.random().toString(36).slice(2),
+function mapPiperVoiceToIzabela(voiceKey: string, info: PiperVoiceInfo): IzabelaVoice {
+    return {
+        id: voiceKey,
+        name: info.name || voiceKey.replace(/\.onnx$/i, ''),
+        category: 'Piper',
+        languageCode: parseLanguageCode(voiceKey, info),
     };
+}
+
+async function getPiperVoices(apiUrl: string) {
+    const response = await fetchWithRetry(`${apiUrl}/voices`, {}, {
+        event: 'piper:voices',
+        attempts: 3,
+        timeoutMs: 15000,
+    });
+
+    if (!response.ok) {
+        throw new Error(`Piper voices request failed: ${response.status} ${response.statusText}`);
+    }
+
+    const voices = await response.json() as PiperVoicesResponse;
+
+    return Object.entries(voices).map(([voiceKey, info]) => mapPiperVoiceToIzabela(voiceKey, info));
+}
+
+function buildPiperSynthesisPayload(
+    formData: Record<string, unknown>,
+    text: string,
+    requestedVoiceId?: string,
+): PiperSynthesisPayload {
+    const configuredDefaultVoice = String(getFormValue(formData, 'defaultVoice', '')).trim();
+    const voice = requestedVoiceId?.trim() || configuredDefaultVoice || undefined;
+    const payload: PiperSynthesisPayload = { text };
+
+    if (voice) {
+        payload.voice = voice;
+    }
+
+    const lengthScale = getFormValue(formData, 'length_scale', 1);
+    if (typeof lengthScale === 'number' && lengthScale > 0 && lengthScale !== 1) {
+        payload.length_scale = lengthScale;
+    }
+
+    const noiseScale = getFormValue(formData, 'noise_scale', 0);
+    if (typeof noiseScale === 'number' && noiseScale > 0) {
+        payload.noise_scale = noiseScale;
+    }
+
+    const noiseWScale = getFormValue(formData, 'noise_w_scale', 0);
+    if (typeof noiseWScale === 'number' && noiseWScale > 0) {
+        payload.noise_w_scale = noiseWScale;
+    }
+
+    return payload;
+}
+
+async function synthesizeWithPiper(apiUrl: string, payload: PiperSynthesisPayload) {
     const startedAt = Date.now();
 
-    devLog('tts-api:run:request', {
-        endpoint: '/gradio_api/run/generate_voice_design',
-        fnIndex,
+    devLog('piper:synthesize:request', {
+        endpoint: `${apiUrl}/`,
         payload,
     });
 
-    const response = await fetchWithRetry(getGradioApiUrl(apiUrl, 'run/generate_voice_design'), {
+    const response = await fetchWithRetry(`${apiUrl}/`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(payload),
     }, {
-        event: 'tts-api:run',
+        event: 'piper:synthesize',
         attempts: 1,
-        timeoutMs: 10 * 60 * 1000,
-    });
-
-    const responseText = await response.text();
-
-    devLog('tts-api:run:response-body', {
-        status: response.status,
-        durationMs: Date.now() - startedAt,
-        bodyPreview: responseText.slice(0, 1000),
+        timeoutMs: 5 * 60 * 1000,
     });
 
     if (!response.ok) {
-        throw new Error(`TTS API run failed: ${response.status} ${response.statusText} ${responseText}`);
+        const responseText = await response.text();
+        throw new Error(`Piper synthesis failed: ${response.status} ${response.statusText} ${responseText}`);
     }
 
-    const data = JSON.parse(responseText) as { data?: GenerateVoiceDesignResponseData };
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
 
-    if (!data.data?.[0]?.url) {
-        throw new Error(`TTS API did not return an audio file URL: ${responseText}`);
-    }
+    devLog('piper:synthesize:complete', {
+        durationMs: Date.now() - startedAt,
+        bytes: audioBuffer.length,
+        contentType: response.headers.get('content-type'),
+    });
 
-    return data.data;
+    return {
+        audioBuffer,
+        contentType: response.headers.get('content-type') || 'audio/wav',
+    };
 }
 
 expressApp.use(cors());
@@ -274,62 +295,25 @@ expressApp.use((req, res, next) => {
     next();
 });
 
-function getConfiguredTtsApiUrl() {
-    const formData = store.get(FORM_STORAGE_KEY, {}) as Record<string, unknown>;
-    const configuredUrl = process.env.XTTS_API_URL || formData.apiUrl || DEFAULT_TTS_API_URL;
-
-    const apiUrl = String(configuredUrl)
-        .trim()
-        .replace(/[?#].*$/, '')
-        .replace(/\/+$/, '');
-
-    devLog('config:tts-api-url', { apiUrl });
-
-    return apiUrl;
-}
-
-function getFormValue<T>(formData: Record<string, unknown>, key: string, fallback: T) {
-    if (LOCAL_FORM_FIELDS.has(key)) {
-        return fallback;
-    }
-
-    return Object.hasOwn(formData, key) ? formData[key] as T : fallback;
-}
-
-function getVoiceDescription(formData: Record<string, unknown>) {
-    const configuredDescription = getFormValue(
-        formData,
-        'qwenVoiceDescription',
-        getFormValue(formData, 'qwenStyleInstruction', DEFAULT_VOICE_DESCRIPTION),
-    );
-
-    return String(configuredDescription || DEFAULT_VOICE_DESCRIPTION);
-}
-
 async function handleListVoices(_req: Request, res: Response) {
-    const voices = [VOICE_DESIGN_VOICE];
-
-    res.status(200).json(voices);
-
     try {
         devLog('voices:list:start');
-        const apiInfo = await getTtsApiInfo(getConfiguredTtsApiUrl());
-        const voiceDesignEndpoint = apiInfo.named_endpoints?.['/generate_voice_design'];
-
-        if (!voiceDesignEndpoint) {
-            devLog('voices:list:metadata-missing', {
-                endpoint: '/generate_voice_design',
-            });
-            return;
-        }
+        const voices = await getPiperVoices(getConfiguredPiperApiUrl());
 
         devLog('voices:list:success', {
-            endpoint: '/generate_voice_design',
-            voices: [VOICE_DESIGN_ID],
+            count: voices.length,
+            voices: voices.map((voice) => voice.id),
         });
+
+        res.status(200).json(voices);
     } catch (error) {
         devLog('voices:list:error', {
             error: error instanceof Error ? error.message : String(error),
+        });
+        console.error('Error listing Piper voices:', error);
+        res.status(500).json({
+            error: 'Failed to list voices',
+            details: error instanceof Error ? error.message : String(error),
         });
     }
 }
@@ -343,79 +327,55 @@ async function handleSynthesizeSpeech(req: Request, res: Response) {
             body: {
                 payload: {
                     text,
-                },
-            },
-        } = req
-        const formData = store.get(FORM_STORAGE_KEY, {}) as Record<string, unknown>
-        const language = getFormValue(formData, 'language', 'English')
-        const voiceDescription = getVoiceDescription(formData)
-        const seed = getFormValue(formData, 'qwenSeed', -1)
+                    voice,
+                } = {},
+            } = {},
+        } = req;
+        const formData = store.get(FORM_STORAGE_KEY, {}) as Record<string, unknown>;
+        const requestedVoiceId = typeof voice?.id === 'string' ? voice.id : undefined;
+        const piperPayload = buildPiperSynthesisPayload(
+            formData,
+            String(text ?? ''),
+            requestedVoiceId,
+        );
+
+        if (!piperPayload.text.trim()) {
+            res.status(400).json({ error: 'Text is required' });
+            return;
+        }
 
         devLog('speech:generate:start', {
             route: req.path,
-            textLength: typeof text === 'string' ? text.length : undefined,
-            language,
-            voiceDescription,
-            seed,
+            textLength: piperPayload.text.length,
+            voice: piperPayload.voice,
+            length_scale: piperPayload.length_scale,
+            noise_scale: piperPayload.noise_scale,
+            noise_w_scale: piperPayload.noise_w_scale,
         });
 
-        const ttsPayload = {
-            text,
-            language,
-            voice_description: voiceDescription,
-            seed,
-        };
+        const { audioBuffer, contentType } = await synthesizeWithPiper(
+            getConfiguredPiperApiUrl(),
+            piperPayload,
+        );
 
-        devLog('tts-api:predict:request', {
-            endpoint: '/generate_voice_design',
-            payload: ttsPayload,
-        });
-
-        const resultData = await runVoiceDesign(getConfiguredTtsApiUrl(), ttsPayload);
-        const audio = resultData[0];
-        const audioUrl = audio?.url;
-
-        if (!audioUrl) {
-            throw new Error('TTS API did not return an audio file URL')
-        }
-
-        devLog('speech:generate:complete', {
-            audioUrl,
-            status: resultData[1],
-        });
-
-        const audioResponse = await fetch(audioUrl);
-
-        if (!audioResponse.ok || !audioResponse.body) {
-            throw new Error(`Failed to fetch generated audio: ${audioResponse.status} ${audioResponse.statusText}`)
-        }
-
-        const contentType = audioResponse.headers.get('content-type') || audio.mime_type || 'audio/wav'
-        const contentLength = audioResponse.headers.get('content-length')
-
-        devLog('speech:audio-fetch:success', {
+        devLog('speech:response:send', {
+            bytes: audioBuffer.length,
             contentType,
-            contentLength,
         });
 
         res.writeHead(200, {
             'Content-Type': contentType,
-        })
-
-        const audioBuffer = Buffer.from(await audioResponse.arrayBuffer())
-        devLog('speech:response:send', {
-            bytes: audioBuffer.length,
         });
-        res.end(audioBuffer)
+        res.end(audioBuffer);
     } catch (error) {
         devLog('speech:error', {
             route: req.path,
             error: error instanceof Error ? error.message : String(error),
         });
         console.error('Error generating speech:', error);
-        res.status(500).json({ 
+        res.status(500).json({
             error: 'Failed to generate speech',
-            details: error instanceof Error ? error.message : String(error)
+            details: error instanceof Error ? error.message : String(error),
         });
     }
 }
@@ -430,7 +390,7 @@ export function startExpressServer() {
             devLog('server:listening', { port: PORT });
             resolve(server);
         });
-        
+
         server.on('error', (err) => {
             devLog('server:error', { error: err.message });
             console.error('Failed to start Express server:', err);

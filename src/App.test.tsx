@@ -5,6 +5,6 @@ import App from './App.tsx'
 describe('App', () => {
   test('renders', async () => {
     render(<App />)
-    expect(await screen.findByText('TTS API URL')).toBeDefined()
+    expect(await screen.findByText('Piper API URL')).toBeDefined()
   })
 })

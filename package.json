@@ -19,7 +19,6 @@
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
-    "@gradio/client": "^1.14.2",
     "@rjsf/chakra-ui": "^6.0.0-beta.8",
     "@rjsf/core": "^6.0.0-beta.8",
     "@rjsf/utils": "^6.0.0-beta.8",
@@ -75,9 +74,6 @@
       }
     ],
     "asar": true,
-    "asarUnpack": [
-      "node_modules/@gradio/client/**/*"
-    ],
     "mac": {
       "category": "public.app-category.utilities",
       "icon": "public/256x256.png",
