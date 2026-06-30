@@ -7,9 +7,9 @@ import { FORM_STORAGE_KEY } from './consts.ts'
 import { Button, Dialog, VStack } from '@chakra-ui/react'
 import { X } from 'lucide-react'
 
-export default function PiperServerForm() {
+export default function ServerForm() {
     const [formData, setFormData] = useState<any>(null);
-    const [readyToSaveLocally, setReadyToSaveLocally] = useState(false);
+    const [readyToSaveLocally, setReadyToSaveocally] = useState(false);
     const [open, setOpen] = useState(false);
     useEffect(() => {
         const loadFormData = async () => {
@@ -28,7 +28,7 @@ export default function PiperServerForm() {
         };
 
         loadFormData()
-            .finally(() => setReadyToSaveLocally(true));
+            .finally(() => setReadyToSaveocally(true));
     }, []);
 
     const updateFormData = async (formData: any) => {
